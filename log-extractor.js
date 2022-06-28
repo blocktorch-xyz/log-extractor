@@ -244,6 +244,10 @@ class LogExtractor {
           await transformAndLoad(block, contractAddresses, abis)
         }, 180 * 1000)
       })
+
+      provider.on('error', async (error) => {
+        console.log(`❌ stream emitted tge following error: ${error}`)
+      })
     } catch (error) {
       console.log(`❌ ${error}`)
     }
