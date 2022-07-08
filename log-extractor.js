@@ -108,7 +108,7 @@ const ingestEmptyLog = async (log, txs) => {
 }
 
 const ingest = async (log, txs, indexName, logId, additionalTags) => {
-  let tags = ['ethereum', 'contract', ...additionalTags]
+  let tags = [process.env.CHAIN, 'contract', ...additionalTags]
 
   const document = {
     index: indexName,
@@ -116,7 +116,7 @@ const ingest = async (log, txs, indexName, logId, additionalTags) => {
       logsID: logId,
       logs: log,
       txs: txs,
-      chain: 'ethereum',
+      chain: process.env.CHAIN,
       tags: tags,
       blockNumber: txs.blockNumber,
       timestamp: new Date(),
@@ -145,7 +145,7 @@ const transformAndLoad = async (block, contractAddresses, abis) => {
 
         try {
           // get abis
-          if (txs.logs.length > 0) {
+          if (txs.logs && txs.logs.length > 0) {
             const abiRes = await fetchContractABI(txs.to)
             abis[txs.to] = abiRes
             if (abiRes.length > 0) {
@@ -229,7 +229,7 @@ class LogExtractor {
   async watch() {
     try {
       const provider = new ethers.providers.AlchemyWebSocketProvider(
-        'homestead',
+        process.env.RPC_NETWORK,
         process.env.ALCHEMY_API_KEY,
       )
 
@@ -242,7 +242,7 @@ class LogExtractor {
           let abis = {}
 
           await transformAndLoad(block, contractAddresses, abis)
-        }, 180 * 1000)
+        }, process.env.TIMEOUT)
       })
 
       provider.on('error', async (error) => {
