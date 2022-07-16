@@ -86,17 +86,17 @@ const fetchCurrentBlockNum = async () => {
   }
 }
 
-const ingestDecodedLog = async (log, txs) => {
+const ingestDecodedLog = async (rawLog, decodedLog, txs) => {
   let indexName = 'decoded-evm-logs'
-  await ingest(JSON.stringify(log), txs, indexName, log.id, ['decoded'])
+  await ingestEthEventLog(rawLog, decodedLog, txs, indexName, ['decoded'])
 }
 const ingestNotParsedLog = async (log, txs) => {
   let indexName = 'not-parsed-evm-logs'
-  await ingest(log, txs, indexName, log.id, ['not-decoded', 'not-parsed'])
+  await ingestEthEventLog(log, {}, txs, indexName, ['not-decoded', 'not-parsed'])
 }
 const ingestNotDecodedLog = async (log, txs) => {
   let indexName = 'not-decoded-evm-logs'
-  await ingest(log, txs, indexName, log.id, [
+  await ingestEthEventLog(log, {}, txs, indexName, [
     'not-decoded',
     'abi-not-available',
   ])
@@ -104,31 +104,78 @@ const ingestNotDecodedLog = async (log, txs) => {
 const ingestEmptyLog = async (log, txs) => {
   let indexName = 'empty-evm-logs'
   let logId = Math.floor(Math.random() * 100)
-  await ingest(log, txs, indexName, logId, ['empty-log'])
+  await ingestEthEventLog(log, log, txs, indexName, ['empty-log'])
 }
 
-const ingest = async (log, txs, indexName, logId, additionalTags) => {
-  let tags = [process.env.CHAIN, 'contract', ...additionalTags]
+const ingestEthEventLog = async (rawlog, decodedLog, txs, indexName, additionalTags) => {
+  let tags = [process.env.CHAIN, ...additionalTags]
 
   const document = {
     index: indexName,
     body: {
-      logsID: logId,
-      logs: log,
-      txs: txs,
+      type: "event",
+      // TODO: needs to be fetched from etherscan
+      contract: "unknown",
+      from: txs.from,
+      // abi is needed to decode the event name
+      name: !decodedLog || Object.keys(decodedLog).length === 0 ? "unknown" : decodedLog.eventFragment.name,
+      status: txs.status === true ? "success" : "fail",
       chain: process.env.CHAIN,
       tags: tags,
       blockNumber: txs.blockNumber,
+      // TODO: propagate block timestamp
       timestamp: new Date(),
+      metadata: decodedLog,
+      rawData: rawlog,
+      address: txs.to
     },
   }
   try {
-    console.log(`🏁 ingesting to index: ${indexName}`)
+    console.log(`🏁 ingesting event log to index: ${indexName}`)
+    console.log(`🌱 Ingesting event log: ${JSON.stringify(document, null, 2)}`)
     await elasticClient.index(document)
     await elasticClient.indices.refresh({ index: indexName })
   } catch (error) {
     console.log(
-      `❌ error ingesting: ${error} in index ${indexName} and log: ${log}`,
+      `❌ error ingesting eth event log: ${error} in index ${indexName} and log: ${rawlog}`,
+    )
+  }
+}
+
+const ingestEthTransaction = async (parsedTxs, rawTxs, additionalTags) => {
+  let tags = [process.env.CHAIN, ...additionalTags]
+  const decodedTransactionIndex = !parsedTxs || Object.keys(parsedTxs).length === 0 ? 'not-decoded-evm-transactions' : 'decoded-evm-transactions'
+
+  const document = {
+    index: decodedTransactionIndex,
+    body: {
+
+      type: "function",
+      // TODO: needs to be fetched from etherscan
+      contract: "unknown",
+      from: rawTxs.from,
+      // abi is needed to decode the event name
+      name: !parsedTxs || Object.keys(parsedTxs).length === 0 ? "unknown" : parsedTxs.name,
+      status: rawTxs.status === true ? "success" : "fail",
+      chain: process.env.CHAIN,
+      tags: tags,
+      blockNumber: rawTxs.blockNumber,
+      // TODO: propagate block timestamp
+      timestamp: new Date(),
+      metadata: parsedTxs,
+      rawData: rawTxs,
+      address: rawTxs.to
+    }
+  }
+
+  try {
+    console.log(`🏁 Ingesting transaction to index: ${decodedTransactionIndex}`)
+    console.log(`🌈 Ingesting transaction: ${JSON.stringify(document, null, 2)}`)
+    await elasticClient.index(document)
+    await elasticClient.indices.refresh({ index: decodedTransactionIndex })
+  } catch (error) {
+    console.log(
+      `❌ could't index a transaction in index ${decodedTransactionIndex}. error: ${error}. transaction: ${rawTxs}`,
     )
   }
 }
@@ -138,18 +185,25 @@ const transformAndLoad = async (block, contractAddresses, abis) => {
     block.transactions.map(async (txs) => {
       // check if address is a contract address
       const isContractAddress = await isContract(txs.to)
-      console.log(`${txs.to} is a contracts? ${isContractAddress}`)
-
+      // console.log(`${txs.to} is a contracts? ${isContractAddress}`)
+      
       if (isContractAddress) {
         contractAddresses.push(txs.to)
-
+        
         try {
           // get abis
           if (txs.logs && txs.logs.length > 0) {
-            const abiRes = await fetchContractABI(txs.to)
+            const abiRes = await fetchContractABI(txs.to).catch(console.log)
             abis[txs.to] = abiRes
             if (abiRes.length > 0) {
-              // TODO: missing rate limite handling
+              const iface = new ethers.utils.Interface(abiRes)
+
+              // try parsing transaction
+              const parsedTransaction = iface.parseTransaction({data: txs.input, value: txs.value}) || {}
+
+              await ingestEthTransaction(parsedTransaction, txs,["parsed-transaction"]).catch(console.log)
+
+              // TODO: missing rate limit handling
               // try to decode and ingest logs
               await Promise.all(
                 txs.logs.map(async (log) => {
@@ -160,9 +214,8 @@ const transformAndLoad = async (block, contractAddresses, abis) => {
                         `✅ ingested not decoded txs: ${JSON.stringify(log)}`,
                       )
                     } else {
-                      const iface = new ethers.utils.Interface(abiRes)
                       let parsedLog = iface.parseLog(log)
-                      await ingestDecodedLog(parsedLog, txs).catch(console.log)
+                      await ingestDecodedLog(log, parsedLog, txs).catch(console.log)
                       console.log(
                         `✅ ingested decoded txs: ${JSON.stringify(parsedLog)}`,
                       )
@@ -186,6 +239,7 @@ const transformAndLoad = async (block, contractAddresses, abis) => {
                 }),
               )
             } else {
+              // ABI not available ingest raw transaction data
               console.log(`------> ${abiRes.length}`)
               console.log(
                 `⚠️ (type: ${typeof abiRes}) missed ${
@@ -194,13 +248,14 @@ const transformAndLoad = async (block, contractAddresses, abis) => {
               )
             }
           } else {
+            // transaction has no logs
             await ingestEmptyLog({}, txs).catch(console.log)
             console.log(
               `✅ ingested txs without logs: ${JSON.stringify(txs.logs)}`,
             )
           }
         } catch (error) {
-          console.log(`❌ ${error}`)
+          console.log(`❌ Ingestion failed with error ${error} || failed at transaction ${txs}`)
         }
       }
     }),
